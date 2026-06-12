@@ -1,0 +1,12 @@
+flask
+flask-cors
+gunicorn
+requests
+pdfplumber
+pytesseract
+pdf2image
+beautifulsoup4
+boto3
+anthropic
+Pillow
+pyngrok
