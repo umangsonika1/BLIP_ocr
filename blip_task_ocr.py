@@ -7,6 +7,8 @@ Original file is located at
     https://colab.research.google.com/drive/14j1jDDT9ZrrgynlSb2SZVhPUnyzEQd6c
 """
 
+# !apt-get update
+# !apt-get install -y poppler-utils tesseract-ocr
 # !pip install flask flask-cors requests pdfplumber pytesseract pdf2image beautifulsoup4 boto3 pyngrok anthropic
 
 import os
@@ -36,10 +38,17 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB cap
 
 os.environ["NGROK_AUTH_TOKEN"] = "3365NptIuQXwEr8DryJhrQbVNe8_7eBQ6XLZFzcoyzRybeude"
 
+# !apt-get install -y poppler-utils tesseract-ocr
+
 CONFIG = {
     "ocr_dpi": 400,
     "use_llm_default": False,
     "llm_model": os.getenv("LLM_MODEL", "claude-sonnet-4-6"),
+    # and ANTHROPIC_API_KEY is set. Set llm_auto_fallback False to disable.
+    "llm_auto_fallback": os.getenv("LLM_AUTO_FALLBACK", "true").lower() == "true",
+    "llm_fallback_threshold": int(os.getenv("LLM_FALLBACK_THRESHOLD", "25")),
+    # on sparse-text pages or pages that contain a drawing.
+    "always_ocr": os.getenv("ALWAYS_OCR", "false").lower() == "true",
 }
 
 # extraction schema (the "required data")
@@ -78,26 +87,24 @@ SCHEMA = {
     "absolute_discharging_temp_C": {"type": "str", "aliases": ["absolute discharging temperature (battery temperature)", "absolute discharging temperature", "absolute discharge temperature", "absolute discharging temp (battery temp)", "absolute discharging temp", "absolute discharge temp"]},
     "charging_temperature_C": {"type": "str", "aliases": ["charging temperature", "charge temperature", "charging temp", "charge temp"]},
     "discharging_temperature_C": {"type": "str", "aliases": ["discharging temperature", "discharge temperature", "discharging temp", "discharge temp"]},
-    "storage_temperature_C": {"type": "str", "aliases": ["storage temperature", "storage temp"]},
-    "operating_temp_C": {"type": "str", "aliases": ["operating temperature", "operating temp", "working temperature", "operation temperature", "ambient temperature"]},  # NEW
+    "operating_temp_C": {"type": "str", "aliases": ["operating temperature", "operating temp", "working temperature", "operation temperature", "ambient temperature"]},
     "max_operating_temp_C": {"type": "num", "aliases": ["maximum operating temperature", "max operating temperature", "maximum operating temp", "max operating temp"]},
     "min_operating_temp_C": {"type": "num", "aliases": ["minimum operating temperature", "min operating temperature", "minimum operating temp", "min operating temp"]},
     "max_safe_temp_C": {"type": "num", "aliases": ["maximum safe temperature", "max safe temperature", "maximum safe temp", "max safe temp"]},
     "min_safe_temp_C": {"type": "num", "aliases": ["minimum safe temperature", "min safe temperature", "minimum safe temp", "min safe temp"]},
 
     # --- physical ---
-    "weight_g": {"type": "num", "aliases": ["weight", "cell weight", "mass", "net weight"]},  # NEW
-    "dimensions_mm": {"type": "str", "aliases": ["dimensions", "dimension", "cell dimensions", "size (l*w*h)", "size", "l*w*h", "outline dimension"]},  # NEW
-    "height_with_terminal_mm": {"type": "num", "aliases": ["height(h) with terminal", "height with terminal", "height (h) with terminal", "height", "cell height"]},
-    "length_mm": {"type": "num", "aliases": ["length", "length(l)", "length (l)", "cell length", "width"]},
-    "thickness_mm": {"type": "num", "aliases": ["thickness", "thickness(t)", "thickness (t)", "cell thickness", "depth"]},
-    "laser_welding_depth_mm": {"type": "num", "aliases": ["laser welding depth", "welding depth"]},
+    "weight_g": {"type": "num", "aliases": ["weight", "cell weight", "mass", "net weight"]},
+    "dimensions_mm": {"type": "str", "aliases": ["dimensions", "dimension", "cell dimensions", "size (l*w*h)", "size", "l*w*h", "outline dimension", "cell size"]},
+    "length_mm": {"type": "num", "aliases": ["length(l)", "length (l)", "cell length", "length"]},
+    "width_mm": {"type": "num", "aliases": ["width(w)", "width (w)", "cell width", "width"]},
+    "thickness_mm": {"type": "num", "aliases": ["thickness(t)", "thickness (t)", "cell thickness", "thickness", "depth"]},
 
-    # --- cycle life ---
-    "cycle_life": {"type": "int", "aliases": ["cycle life", "rated cycle life", "cycle count", "service life"]},  # NEW (replaces rated_cycle_life)
-    "cycle_25C_standard": {"type": "str", "aliases": ["25℃ standard cycle", "25c standard cycle", "standard cycle"]},
-    "cycle": {"type": "str", "aliases": ["cycle"]},
-    "storage": {"type": "str", "aliases": ["storage"]},
+    # --- cycle life (single consolidated field, integer) ---
+    "cycle_life": {"type": "int", "aliases": [
+        "cycle life", "rated cycle life", "cycle count", "service life",
+        "25℃ standard cycle", "25c standard cycle", "standard cycle",
+        "cycle life @25℃", "cycle performance", "cycles"]},
 }
 
 FIELDS = list(SCHEMA.keys())
@@ -162,28 +169,282 @@ def _value_score(cell):
     return score
 
 
-def _pairs_from_pdf(pdf):
-    """Extract (label, value) pairs from 2+ column tables in a pdfplumber pdf.
+def _norm_cell(c):
+    """Normalize a single table cell: collapse internal newlines/whitespace."""
+    if c is None:
+        return ""
+    return re.sub(r"\s+", " ", str(c)).strip()
 
-    For rows with 3+ columns (e.g. Item | Standard | Remarks), choose the
-    column that looks most like a value, not blindly the last one. Also emit
-    every other candidate as a fallback so coercion can pick a valid one.
+
+def _looks_like_label(s):
+    """True if a cell reads like a parameter NAME (not a value/remark)."""
+    s = str(s).strip()
+    if not s:
+        return False
+    # mostly alphabetic, few digits, not a pure number/range
+    if re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?", s):
+        return False
+    letters = sum(ch.isalpha() for ch in s)
+    return letters >= 2
+
+
+def _emit_pair(pairs, label, value):
+    label = _norm_cell(label)
+    value = _norm_cell(value)
+    if label and value and _looks_like_label(label):
+        pairs.append((label, value))
+
+
+def _pairs_from_table(table):
+    """Extract (label, value) pairs from one table (list of rows of cells).
+
+    Handles four common datasheet layouts:
+      1. Two columns:                 Item | Value
+      2. Item | Value | Remarks (3+): pick the most value-like middle column
+      3. Multiple pairs per row:      Item | Val | Item | Val | ...
+      4. Header-defined columns:      first row = headers, match label col to
+                                      each value col (Parameter | Min | Typ | Max)
     """
     pairs = []
-    for page in pdf.pages:
-        for table in page.extract_tables() or []:
-            for row in table:
-                cells = [str(c).strip() for c in row if c and str(c).strip()]
-                if len(cells) < 2:
-                    continue
-                label = cells[0]
-                candidates = cells[1:]
-                best = max(candidates, key=_value_score)
-                pairs.append((label, best))
-                for c in candidates:
-                    if c != best:
-                        pairs.append((label, c))
+    # Drop fully empty rows; normalize cells but keep column positions.
+    rows = []
+    for row in table:
+        cells = [_norm_cell(c) for c in row]
+        if any(cells):
+            rows.append(cells)
+    if not rows:
+        return pairs
+
+    width = max(len(r) for r in rows)
+    for r in rows:
+        r += [""] * (width - len(r))  # pad ragged rows
+
+    # --- Layout 4: header row with Parameter + Min/Typ/Max style columns ---
+    header = [c.lower() for c in rows[0]]
+    valueish_headers = {"value", "values", "spec", "specification", "standard",
+                        "typ", "typical", "nom", "nominal", "min", "minimum",
+                        "max", "maximum", "rating", "parameter value", "data",
+                        "parameters"}
+    label_header_words = ("item", "parameter", "name", "description", "property",
+                          "characteristic", "项目", "参数")
+
+    # Pick the label column: prefer a header named item/parameter/etc.;
+    # otherwise the column (excluding pure index columns like 'No.') whose
+    # body cells are most label-like.
+    label_col = None
+    for i, h in enumerate(header):
+        if any(w in h for w in label_header_words):
+            label_col = i
+            break
+    if label_col is None:
+        best_i, best_score = 0, -1
+        for i in range(width):
+            body = [r[i] for r in rows[1:] if i < len(r)]
+            score = sum(_looks_like_label(c) for c in body)
+            # demote index columns (header 'no'/'#' or mostly tiny integers)
+            if header[i] in ("no", "no.", "#", "sn", "s.no", "sr", "sr.no", "序号"):
+                score -= 100
+            if score > best_score:
+                best_i, best_score = i, score
+        label_col = best_i
+
+    has_value_header = any(any(v in h for v in valueish_headers)
+                           for i, h in enumerate(header) if i != label_col)
+    if has_value_header and len(rows) > 1:
+        value_cols = [i for i, h in enumerate(header)
+                      if i != label_col and any(v in h for v in valueish_headers)]
+        if not value_cols:
+            value_cols = [i for i in range(width) if i != label_col]
+        # Prefer typical/nominal columns first so they win the "first match"
+        # in extract_from_pairs; min/max come after as fallbacks.
+        def _col_priority(i):
+            h = header[i]
+            if any(k in h for k in ("typ", "nom", "value", "standard", "rating", "spec")):
+                return 0
+            if "max" in h:
+                return 2
+            if "min" in h:
+                return 3
+            return 1
+        value_cols.sort(key=_col_priority)
+        for r in rows[1:]:
+            label = r[label_col]
+            for vc in value_cols:
+                _emit_pair(pairs, label, r[vc])
+        return pairs
+
+    # --- Layouts 1-3: scan each row for label/value adjacencies ---
+    for r in rows:
+        nonempty = [(i, c) for i, c in enumerate(r) if c]
+        if len(nonempty) < 2:
+            continue
+
+        # Layout 3: alternating label/value pairs across the row.
+        # Detect when there are >=4 non-empty cells and they alternate.
+        if len(nonempty) >= 4:
+            cells = [c for _, c in nonempty]
+            emitted = False
+            for j in range(0, len(cells) - 1, 2):
+                lab, val = cells[j], cells[j + 1]
+                # label cell must read like a name; value cell just needs a digit
+                if _looks_like_label(lab) and re.search(r"\d", val):
+                    _emit_pair(pairs, lab, val)
+                    emitted = True
+            if emitted:
+                continue
+
+        # Layouts 1-2: first non-empty cell is the label; among the rest,
+        # emit the most value-like as primary and the others as fallbacks.
+        label = nonempty[0][1]
+        candidates = [c for _, c in nonempty[1:]]
+        if not candidates:
+            continue
+        best = max(candidates, key=_value_score)
+        _emit_pair(pairs, label, best)
+        for c in candidates:
+            if c != best:
+                _emit_pair(pairs, label, c)
     return pairs
+
+
+def _pairs_from_pdf(pdf):
+    """Extract (label, value) pairs from all tables across a pdfplumber pdf.
+
+    Uses two table-detection strategies (lines-based and text-based) so that
+    borderless / whitespace-aligned datasheet tables are also captured.
+    """
+    pairs = []
+    seen = set()
+
+    def _add(new):
+        for lab, val in new:
+            k = (lab.lower(), val.lower())
+            if k not in seen:
+                seen.add(k)
+                pairs.append((lab, val))
+
+    line_settings = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+    text_settings = {"vertical_strategy": "text", "horizontal_strategy": "text",
+                     "snap_tolerance": 4, "join_tolerance": 4}
+
+    for page in pdf.pages:
+        for settings in (None, line_settings, text_settings):
+            try:
+                tables = (page.extract_tables(settings) if settings
+                          else page.extract_tables())
+            except Exception:
+                tables = []
+            for table in tables or []:
+                _add(_pairs_from_table(table))
+    return pairs
+
+
+def _pairs_from_text_lines(text):
+    """Extract (label, value) pairs from free-text/OCR lines that didn't go
+    through table extraction. Splits on multiple spaces, tabs, or colons so
+    OCR'd 'spec table' rows that lost their grid still yield pairs."""
+    pairs = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or len(line) > 120:
+            continue
+        # split label from value on a colon or a run of 2+ spaces / tab
+        m = re.split(r"\s*[:：]\s*|\s{2,}|\t", line, maxsplit=1)
+        if len(m) == 2:
+            label, value = m[0].strip(), m[1].strip()
+            if label and value and _looks_like_label(label) and re.search(r"\d", value):
+                pairs.append((label, value))
+    return pairs
+
+
+def _extract_dimensions_from_text(text):
+    """Find cell dimensions from drawing callouts / dimension lines.
+
+    Handles: 'L*W*H', 'L×W×H', and separate 'Length 173.7 Width 72 Height 207.5'
+    style callouts that OCR produces from mechanical drawings. Returns a dict
+    with any of length_mm / width_mm / thickness_mm / dimensions_mm found."""
+    out = {}
+    # Combined triple anywhere.
+    m = re.search(r"(\d{2,4}(?:\.\d+)?)\s*[x*×]\s*(\d{2,4}(?:\.\d+)?)\s*[x*×]\s*(\d{2,4}(?:\.\d+)?)",
+                  text)
+    if m:
+        a, b, c = (float(x) for x in m.groups())
+        out["dimensions_mm"] = f"{m.group(1)}*{m.group(2)}*{m.group(3)}"
+        # convention L >= W typically; assign largest=length, smallest=thickness
+        vals = sorted([a, b, c])
+        out["thickness_mm"], out["width_mm"], out["length_mm"] = vals
+
+    # Labeled callouts (use the first plausible mm value after each keyword).
+    def _near(keywords):
+        for kw in keywords:
+            mm = re.search(rf"{kw}[^\d]{{0,12}}(\d{{1,4}}(?:\.\d+)?)\s*mm",
+                           text, re.IGNORECASE)
+            if not mm:
+                mm = re.search(rf"{kw}[^\d]{{0,12}}(\d{{1,4}}(?:\.\d+)?)",
+                               text, re.IGNORECASE)
+            if mm:
+                v = float(mm.group(1))
+                if 1.0 <= v <= 1000.0:
+                    return v
+        return None
+
+    for key, kws in (("length_mm", ["length", r"\bl\b"]),
+                     ("width_mm", ["width", r"\bw\b"]),
+                     ("thickness_mm", ["thickness", "depth", r"\bt\b"])):
+        v = _near(kws)
+        if v is not None:
+            out.setdefault(key, v)
+
+    # Bare callouts near a 'dimension/outline/size' heading: collect plausible
+    # mm numbers in that vicinity and assign by magnitude (largest=length).
+    if not all(out.get(k) for k in ("length_mm", "width_mm", "thickness_mm")):
+        head = re.search(r"(outline\s*dimension|cell\s*dimension|dimension|size)",
+                         text, re.IGNORECASE)
+        if head:
+            window = text[head.start(): head.start() + 220]
+            nums = [float(n) for n in re.findall(r"(?<!\d)(\d{1,3}(?:\.\d)?)(?!\d)", window)
+                    if 10.0 <= float(n) <= 400.0]
+            # de-dup while preserving order
+            seen = set(); uniq = []
+            for n in nums:
+                if n not in seen:
+                    seen.add(n); uniq.append(n)
+            if len(uniq) >= 2:
+                vals = sorted(uniq[:3])
+                if len(vals) == 3:
+                    out.setdefault("thickness_mm", vals[0])
+                    out.setdefault("width_mm", vals[1])
+                    out.setdefault("length_mm", vals[2])
+                    out.setdefault("dimensions_mm", f"{vals[2]}*{vals[1]}*{vals[0]}")
+    return out
+
+
+def _page_has_graphics(page):
+    """Heuristic: page likely contains a mechanical drawing (lines/rects/curves
+    or embedded images) whose dimension callouts won't appear in text."""
+    try:
+        n = (len(page.lines or []) + len(page.rects or [])
+             + len(page.curves or []) + len(page.images or []))
+        return n >= 8
+    except Exception:
+        return False
+
+
+def _safe_convert(fn, *args, **kwargs):
+    """Run a pdf2image conversion, degrading gracefully if poppler is missing
+    or rendering fails. Returns [] so the caller falls back to text-only."""
+    try:
+        return fn(*args, **kwargs) or []
+    except Exception as e:
+        msg = str(e).lower()
+        if "poppler" in msg or "pdftoppm" in msg or "pdfinfo" in msg:
+            if not CONFIG.get("_warned_poppler"):
+                print("[WARN] poppler not available; OCR disabled, using text "
+                      "extraction only. Install 'poppler-utils' for full OCR.")
+                CONFIG["_warned_poppler"] = True
+        else:
+            print(f"[WARN] PDF render failed ({e}); skipping OCR for this page.")
+        return []
 
 
 def text_from_pdf_path(path):
@@ -192,13 +453,17 @@ def text_from_pdf_path(path):
         pairs = _pairs_from_pdf(pdf)
         for i, page in enumerate(pdf.pages):
             txt = page.extract_text() or ""
-            if len(txt.strip()) >= 40:
-                pages.append(txt)
-            else:
-                imgs = convert_from_path(path, dpi=CONFIG["ocr_dpi"],
-                                         first_page=i + 1, last_page=i + 1)
-                pages.append(ocr_image(imgs[0]) if imgs else "")
-    return "\n".join(pages), pairs
+            ocr_txt = ""
+            # OCR when text is sparse OR the page has a drawing (callout numbers
+            # like cell dimensions live in graphics, not the text layer).
+            if CONFIG.get("always_ocr") or len(txt.strip()) < 40 or _page_has_graphics(page):
+                imgs = _safe_convert(convert_from_path, path, dpi=CONFIG["ocr_dpi"],
+                                     first_page=i + 1, last_page=i + 1)
+                ocr_txt = ocr_image(imgs[0]) if imgs else ""
+            pages.append(_merge_page_text(txt, ocr_txt))
+    full = "\n".join(pages)
+    pairs += _pairs_from_text_lines(full)
+    return full, pairs
 
 
 def text_from_pdf_bytes(data):
@@ -208,16 +473,32 @@ def text_from_pdf_bytes(data):
         pairs = _pairs_from_pdf(pdf)
         for i, page in enumerate(pdf.pages):
             txt = page.extract_text() or ""
-            if len(txt.strip()) >= 40:
-                pages.append(txt)
-            else:
-                pages.append(None)
+            need_ocr = (CONFIG.get("always_ocr") or len(txt.strip()) < 40
+                        or _page_has_graphics(page))
+            pages.append([txt, None])
+            if need_ocr:
                 ocr_pages.append(i + 1)
     for pageno in ocr_pages:
-        imgs = convert_from_bytes(data, dpi=CONFIG["ocr_dpi"],
-                                  first_page=pageno, last_page=pageno)
-        pages[pageno - 1] = ocr_image(imgs[0]) if imgs else ""
-    return "\n".join(p or "" for p in pages), pairs
+        imgs = _safe_convert(convert_from_bytes, data, dpi=CONFIG["ocr_dpi"],
+                             first_page=pageno, last_page=pageno)
+        pages[pageno - 1][1] = ocr_image(imgs[0]) if imgs else ""
+    merged = [_merge_page_text(t, o or "") for t, o in pages]
+    full = "\n".join(merged)
+    pairs += _pairs_from_text_lines(full)
+    return full, pairs
+
+
+def _merge_page_text(text_layer, ocr_layer):
+    """Combine the digital text layer (authoritative for tables) with OCR
+    output (adds drawing/callout content). Avoid duplicating identical lines."""
+    if not ocr_layer.strip():
+        return text_layer
+    if not text_layer.strip():
+        return ocr_layer
+    have = {re.sub(r"\s+", "", ln).lower() for ln in text_layer.splitlines() if ln.strip()}
+    extra = [ln for ln in ocr_layer.splitlines()
+             if ln.strip() and re.sub(r"\s+", "", ln).lower() not in have]
+    return text_layer + "\n" + "\n".join(extra)
 
 
 def text_from_html(html):
@@ -227,29 +508,86 @@ def text_from_html(html):
     pairs = []
     lines = []
     for table in soup.find_all("table"):
+        grid = []
         for tr in table.find_all("tr"):
             cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            cells = [c for c in cells if c]
-            if len(cells) >= 2:
-                # pick the most value-like cell, not blindly the last
-                best = max(cells[1:], key=_value_score)
-                pairs.append((cells[0], best))
-                for c in cells[1:]:
-                    if c != best:
-                        pairs.append((cells[0], c))
-            if cells:
-                lines.append(" : ".join(cells))
+            grid.append(cells)
+            cells_nonempty = [c for c in cells if c]
+            if cells_nonempty:
+                lines.append(" : ".join(cells_nonempty))
+        pairs.extend(_pairs_from_table(grid))
     text = soup.get_text("\n", strip=True) + "\n" + "\n".join(lines)
     return text, pairs
 
 
+def _preprocess_for_ocr(pil_image):
+    """Return a list of preprocessed PIL images (variants) to OCR.
+
+    Datasheet drawings and small callout numbers OCR poorly at native scale,
+    so we upscale, grayscale, denoise, deskew, and binarize. Multiple variants
+    are returned because no single preprocessing wins on every page.
+    """
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image
+    except Exception:
+        return [pil_image.convert("L")]
+
+    img = np.array(pil_image.convert("L"))
+
+    # Upscale small renders so thin callout digits are legible.
+    h, w = img.shape[:2]
+    if max(h, w) < 2600:
+        scale = 2600.0 / max(h, w)
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # Light denoise that preserves edges.
+    img = cv2.bilateralFilter(img, 5, 40, 40)
+
+    # Deskew using the dominant text angle.
+    try:
+        coords = np.column_stack(np.where(img < 128))
+        if len(coords) > 50:
+            angle = cv2.minAreaRect(coords)[-1]
+            angle = -(90 + angle) if angle < -45 else -angle
+            if abs(angle) > 0.3:
+                M = cv2.getRotationMatrix2D((img.shape[1] / 2, img.shape[0] / 2), angle, 1.0)
+                img = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
+                                     flags=cv2.INTER_CUBIC,
+                                     borderMode=cv2.BORDER_REPLICATE)
+    except Exception:
+        pass
+
+    variants = []
+    # 1) Otsu binarization — good for clean printed tables.
+    _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(Image.fromarray(otsu))
+    # 2) Adaptive threshold — good for shaded / drawing backgrounds.
+    adapt = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY, 31, 11)
+    variants.append(Image.fromarray(adapt))
+    # 3) Plain upscaled grayscale — tesseract sometimes prefers no threshold.
+    variants.append(Image.fromarray(img))
+    return variants
+
+
 def ocr_image(pil_image):
-    img = pil_image.convert("L")
+    """High-accuracy OCR: try several preprocessing variants and PSM modes,
+    keep the longest coherent output (most captured characters)."""
+    variants = _preprocess_for_ocr(pil_image)
     best = ""
-    for psm in (4, 6, 11):
-        out = pytesseract.image_to_string(img, config=f"--oem 3 --psm {psm}")
-        if len(out.strip()) > len(best.strip()):
-            best = out
+    # psm 6 = uniform block, 4 = columns, 11 = sparse text, 3 = auto.
+    for img in variants:
+        for psm in (6, 4, 11, 3):
+            try:
+                out = pytesseract.image_to_string(
+                    img, config=f"--oem 3 --psm {psm} "
+                    "-c preserve_interword_spaces=1")
+            except Exception:
+                continue
+            if len(out.strip()) > len(best.strip()):
+                best = out
     return best
 
 # regex extractor (offline baseline)
@@ -279,13 +617,29 @@ _BOUNDS = {
     "_g": (50.0, 50000.0),     # cell mass in grams
     "_mm": (0.5, 1000.0),
     "_C": (-60.0, 150.0),      # a temperature
+    "cycle_life": (50.0, 100000.0),  # plausible rated cycle count
 }
 
 
+def _is_c_rate(raw):
+    """True if the string is a C-rate like '0.5C', '1C', '1.0 C' (not °C)."""
+    low = raw.lower().strip()
+    return bool(re.match(r"^\d+(?:[.,]\d+)?\s*c\b", low)) \
+        and "°" not in raw and "℃" not in raw
+
+
+def _c_rate_value(raw):
+    """Return the numeric C multiplier, or None."""
+    m = re.match(r"^(\d+(?:[.,]\d+)?)\s*c\b", raw.lower().strip())
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
 def _bounds_for(key):
+    if key in _BOUNDS:
+        return _BOUNDS[key]
     # longest suffix wins (so _mOhm beats shorter suffixes, etc.)
     for suffix in sorted(_BOUNDS, key=len, reverse=True):
-        if key.endswith(suffix):
+        if suffix.startswith("_") and key.endswith(suffix):
             return _BOUNDS[suffix]
     return None
 
@@ -319,10 +673,12 @@ def _coerce_value(key, raw_value):
     if not raw_value or _is_junk_value(raw_value, key):
         return None
 
-    # dimensions field: keep the L*W*H string verbatim
+    # dimensions field: extract just the L*W*H numeric triple
     if key == "dimensions_mm":
-        if _looks_like_dimensions(raw_value):
-            return re.sub(r"\s+", "", raw_value)[:60]
+        m = re.search(r"\d+(?:[.,]\d+)?\s*[x*×]\s*\d+(?:[.,]\d+)?\s*[x*×]\s*\d+(?:[.,]\d+)?",
+                      raw_value)
+        if m:
+            return re.sub(r"\s+", "", m.group(0)).replace("×", "*").replace("x", "*")
         return None
 
     # Range strings stay as text (temperatures, etc.), only for str / _C fields.
@@ -339,6 +695,17 @@ def _coerce_value(key, raw_value):
             n = float(m.group(0).replace(",", "."))
         except ValueError:
             return None
+        low_rv = raw_value.lower()
+        # unit normalization to schema units
+        if key == "weight_g" and "kg" in low_rv:
+            n *= 1000.0                       # kg -> g
+        if key.endswith("_Ah") and re.search(r"mah\b", low_rv):
+            n /= 1000.0                       # mAh -> Ah
+        if key.endswith("_Wh") and re.search(r"\bkwh\b", low_rv):
+            n *= 1000.0                       # kWh -> Wh
+        if key.endswith("_mOhm") and re.search(r"\bohm\b|\bω\b", low_rv) \
+                and not re.search(r"m\s*(?:ohm|ω)", low_rv):
+            n *= 1000.0                       # Ω -> mΩ
         rng = _bounds_for(key)
         if rng and not (rng[0] <= n <= rng[1]):
             return None
@@ -381,14 +748,35 @@ def _split_explicit(line):
     return None
 
 
+def _norm_label(s):
+    """Normalize a label for matching: lowercase, strip units/notes in
+    parentheses, collapse punctuation/whitespace."""
+    s = str(s).lower().strip()
+    s = re.sub(r"\([^)]*\)", " ", s)          # drop parenthetical notes
+    s = re.sub(r"[，,。.:：;；]+$", "", s)       # trailing punctuation
+    s = s.replace("．", ".").replace("－", "-")
+    s = re.sub(r"[_/\\]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _alias_matches(llabel, alias):
-    """Generic, short aliases (<=7 chars or single word) must match the label
-    EXACTLY, to avoid stealing from longer labels. Longer aliases may match by
-    startswith/contains."""
+    """Decide whether a (normalized) label matches an alias.
+
+    Exact match always wins. For multi-word / longer aliases we also allow
+    startswith / contains. Short single-word aliases match only as whole
+    words to avoid stealing from longer labels."""
+    llabel = _norm_label(llabel)
+    alias = _norm_label(alias)
+    if not llabel or not alias:
+        return False
     if llabel == alias:
         return True
     if len(alias) <= 7 or " " not in alias:
-        return False
+        # whole-word match only (e.g. 'weight' matches 'weight g' but not
+        # 'weightless'), still avoids substring theft from longer labels
+        return bool(re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", llabel)) \
+            and abs(len(llabel) - len(alias)) <= 6
     return llabel.startswith(alias) or alias in llabel
 
 
@@ -409,6 +797,14 @@ def extract_from_pairs(pairs, spec, matches):
                 if coerced is not None:
                     spec[key] = coerced
                     matches[key] = f"{str(label).strip()[:40]} => {sval[:40]}"
+                elif key.endswith("_A") and _is_c_rate(sval):
+                    # remember the largest C-rate seen; max-current fields should
+                    # reflect the maximum, converted to amps in post-processing
+                    cr = _c_rate_value(sval)
+                    if cr is not None:
+                        prev = matches.get(key + "__crate")
+                        if prev is None or cr > prev:
+                            matches[key + "__crate"] = cr
                 break
     return spec, matches
 
@@ -425,14 +821,20 @@ def extract_from_text(text, spec, matches):
             extract_from_pairs([ex], spec, matches)
             continue
 
-        lline = line.lower()
+        lline = _norm_label(line)
         for alias, key in _ALIAS_INDEX:
             if spec.get(key) is not None:
                 continue
-            if len(alias) <= 7 or " " not in alias:
-                continue
-            if lline.startswith(alias):
-                remainder = line[len(alias):].strip(" :=\t-")
+            nalias = _norm_label(alias)
+            if not nalias or " " not in nalias and len(nalias) <= 7:
+                # only anchor on reasonably specific aliases in free text
+                if not lline.startswith(nalias + " "):
+                    continue
+            if lline.startswith(nalias):
+                remainder = line[len(alias):].strip(" :=\t-") if lline == _norm_label(line) else ""
+                # robust remainder: take text after the alias occurrence
+                m = re.search(rf"{re.escape(nalias)}\s*[:=\-]?\s*(.+)", lline)
+                remainder = m.group(1).strip() if m else remainder
                 coerced = _coerce_value(key, remainder)
                 if coerced is not None:
                     spec[key] = coerced
@@ -481,16 +883,55 @@ def extract_regex(text, table_pairs=None):
                 v = _coerce_value("nominal_capacity_Ah", m.group(0))
                 if v is not None:
                     spec["nominal_capacity_Ah"] = v
-    if spec.get("nominal_energy_Wh") is None and spec.get("min_energy_Wh") is not None:
-        spec["nominal_energy_Wh"] = spec["min_energy_Wh"]
 
-    # dimensions fallback: look for an L*W*H pattern anywhere
+    # energy sanity: nominal should be >= min; if it's missing or implausibly
+    # small (a mis-grabbed stray number), fall back to min_energy.
+    me = spec.get("min_energy_Wh")
+    ne = spec.get("nominal_energy_Wh")
+    if me is not None and (ne is None or ne < me * 0.5):
+        spec["nominal_energy_Wh"] = me
+    # derive energy from capacity * nominal voltage if still absent
+    if spec.get("nominal_energy_Wh") is None:
+        cap, volt = spec.get("nominal_capacity_Ah"), spec.get("nominal_voltage_V")
+        if cap and volt:
+            spec["nominal_energy_Wh"] = round(cap * volt, 1)
+
+    # currents expressed as C-rate -> amps (using nominal capacity)
+    cap = spec.get("nominal_capacity_Ah")
+    if cap:
+        for ck in ("max_charge_current_A", "max_discharge_current_A"):
+            if spec.get(ck) is None:
+                hit = matches.get(ck + "__crate")
+                if hit:
+                    spec[ck] = round(hit * cap, 1)
+
+    # dimensions: build the combined string from parts, or split a combined one
+    L, W, T = spec.get("length_mm"), spec.get("width_mm"), spec.get("thickness_mm")
+    if spec.get("dimensions_mm") is None and all(x is not None for x in (L, W, T)):
+        spec["dimensions_mm"] = f"{L}*{W}*{T}"
+
+    # dedicated dimension extractor (handles drawing callouts from OCR)
+    if any(spec.get(k) is None for k in
+           ("dimensions_mm", "length_mm", "width_mm", "thickness_mm")):
+        dims = _extract_dimensions_from_text(text)
+        for k, v in dims.items():
+            if spec.get(k) is None:
+                spec[k] = v
+
     if spec.get("dimensions_mm") is None:
-        m = re.search(r"\d+(?:[.,]\d+)?\s*[x*×]\s*\d+(?:[.,]\d+)?\s*[x*×]\s*\d+(?:[.,]\d+)?", text)
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*[x*×]\s*(\d+(?:[.,]\d+)?)\s*[x*×]\s*(\d+(?:[.,]\d+)?)", text)
         if m:
             v = _coerce_value("dimensions_mm", m.group(0))
             if v is not None:
                 spec["dimensions_mm"] = v
+    # backfill individual dims from a combined L*W*T string
+    if spec.get("dimensions_mm"):
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*[x*×]\s*(\d+(?:[.,]\d+)?)\s*[x*×]\s*(\d+(?:[.,]\d+)?)",
+                      spec["dimensions_mm"])
+        if m:
+            for key, g in (("length_mm", 1), ("width_mm", 2), ("thickness_mm", 3)):
+                if spec.get(key) is None:
+                    spec[key] = float(m.group(g).replace(",", "."))
 
     # operating_temp_C fallback: derive from a min/max pair if available
     if spec.get("operating_temp_C") is None:
@@ -498,7 +939,40 @@ def extract_regex(text, table_pairs=None):
         if lo is not None and hi is not None:
             spec["operating_temp_C"] = f"{lo}℃ ~ {hi}℃"
 
+    # --- proximity fallback: for any field still missing, find the alias
+    # anywhere in the linearized text and grab the nearest value within a
+    # short window. Catches label/value split across lines or table cells.
+    _proximity_fill(text, spec, matches)
+
     return spec, matches
+
+
+def _proximity_fill(text, spec, matches):
+    """For still-missing fields, locate the alias in the full text and take the
+    closest plausible value that follows it (within ~60 chars)."""
+    flat = re.sub(r"[ \t]+", " ", text)
+    low = flat.lower()
+    for alias, key in _ALIAS_INDEX:
+        if spec.get(key) is not None:
+            continue
+        nalias = _norm_label(alias)
+        # require a reasonably specific alias to avoid false hits
+        if len(nalias) < 5:
+            continue
+        start = 0
+        while True:
+            idx = low.find(nalias, start)
+            if idx == -1:
+                break
+            start = idx + len(nalias)
+            window = flat[idx + len(nalias): idx + len(nalias) + 60]
+            # stop the window at the next obvious label (a word followed by ':')
+            window = re.split(r"\n", window)[0] if "\n" in window else window
+            coerced = _coerce_value(key, window.strip(" :=\t-|"))
+            if coerced is not None:
+                spec[key] = coerced
+                matches[key] = f"{alias} ~> {window.strip()[:40]}"
+                break
 
 # LLM extractor (optional, Anthropic API)
 # ==========================================================================
@@ -520,11 +994,14 @@ def extract_llm(text, model):
         f"Return exactly this JSON shape (keys fixed):\n{json.dumps(empty_spec(), indent=2)}\n\n"
         "- dimensions_mm: string like '207.5*173.7*72'\n"
         "- operating_temp_C: string range like '-20℃ ~ 60℃'\n"
-        "- cycle_life: integer\n"
+        "- cycle_life: integer cycle count (e.g. 6000). If given as '6000 cycles' "
+        "or 'standard cycle 6000', return just 6000.\n"
         "- weight_g: grams (number)\n"
-        "- max_charge_current_A / max_discharge_current_A: amperes (number)\n"
+        "- max_charge_current_A / max_discharge_current_A: amperes (number). "
+        "If the datasheet gives a C-rate (e.g. '1C'), multiply by nominal "
+        "capacity in Ah to get amps.\n"
         "- If multiple values exist, pick the nominal single-cell value.\n\n"
-        f"DATASHEET TEXT:\n{text[:18000]}"
+        f"DATASHEET TEXT:\n{text[:45000]}"
     )
     msg = client.messages.create(
         model=model, max_tokens=1024, system=LLM_SYSTEM,
@@ -560,11 +1037,20 @@ def run_extraction(source, use_llm=False, llm_model=None):
     method = "regex"
     llm_error = None
 
-    if use_llm:
+    found = sum(1 for k in FIELDS if spec.get(k) is not None)
+
+    # Escalate to the LLM when explicitly requested OR when regex coverage is
+    # low and an API key is configured (auto-fallback for hard datasheets).
+    auto = (not use_llm
+            and CONFIG.get("llm_auto_fallback", True)
+            and bool(os.getenv("ANTHROPIC_API_KEY"))
+            and found < CONFIG.get("llm_fallback_threshold", 25))
+
+    if use_llm or auto:
         try:
             llm_spec = extract_llm(text, llm_model)
             spec = merge_specs(llm_spec, spec)  # prefer LLM, backfill from regex
-            method = "llm+regex"
+            method = "llm+regex" + (" (auto)" if auto else "")
         except Exception as e:
             llm_error = str(e)
             method = "regex (llm failed)"
