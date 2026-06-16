@@ -41,7 +41,7 @@ os.environ["NGROK_AUTH_TOKEN"] = "3365NptIuQXwEr8DryJhrQbVNe8_7eBQ6XLZFzcoyzRybe
 # !apt-get install -y poppler-utils tesseract-ocr
 
 CONFIG = {
-    "ocr_dpi": 400,
+    "ocr_dpi": 300,
     "use_llm_default": False,
     "llm_model": os.getenv("LLM_MODEL", "claude-sonnet-4-6"),
     # and ANTHROPIC_API_KEY is set. Set llm_auto_fallback False to disable.
