@@ -456,7 +456,7 @@ def text_from_pdf_path(path):
             ocr_txt = ""
             # OCR when text is sparse OR the page has a drawing (callout numbers
             # like cell dimensions live in graphics, not the text layer).
-            if CONFIG.get("always_ocr") or len(txt.strip()) < 40 or _page_has_graphics(page):
+            if CONFIG.get("always_ocr") or len(txt.strip()) < 40:
                 imgs = _safe_convert(convert_from_path, path, dpi=CONFIG["ocr_dpi"],
                                      first_page=i + 1, last_page=i + 1)
                 ocr_txt = ocr_image(imgs[0]) if imgs else ""
@@ -473,8 +473,7 @@ def text_from_pdf_bytes(data):
         pairs = _pairs_from_pdf(pdf)
         for i, page in enumerate(pdf.pages):
             txt = page.extract_text() or ""
-            need_ocr = (CONFIG.get("always_ocr") or len(txt.strip()) < 40
-                        or _page_has_graphics(page))
+            need_ocr = (CONFIG.get("always_ocr") or len(txt.strip()) < 40)
             pages.append([txt, None])
             if need_ocr:
                 ocr_pages.append(i + 1)
