@@ -41,11 +41,11 @@ os.environ["NGROK_AUTH_TOKEN"] = "3365NptIuQXwEr8DryJhrQbVNe8_7eBQ6XLZFzcoyzRybe
 # !apt-get install -y poppler-utils tesseract-ocr
 
 CONFIG = {
-    "ocr_dpi": 300,
+    "ocr_dpi": 400,
     "use_llm_default": False,
     "llm_model": os.getenv("LLM_MODEL", "claude-sonnet-4-6"),
     # and ANTHROPIC_API_KEY is set. Set llm_auto_fallback False to disable.
-    "llm_auto_fallback": os.getenv("LLM_AUTO_FALLBACK", "true").lower() == "true",
+    "llm_auto_fallback": os.getenv("LLM_AUTO_FALLBACK", "false").lower() == "true",
     "llm_fallback_threshold": int(os.getenv("LLM_FALLBACK_THRESHOLD", "25")),
     # on sparse-text pages or pages that contain a drawing.
     "always_ocr": os.getenv("ALWAYS_OCR", "false").lower() == "true",
@@ -1042,7 +1042,7 @@ def run_extraction(source, use_llm=False, llm_model=None):
     # Escalate to the LLM when explicitly requested OR when regex coverage is
     # low and an API key is configured (auto-fallback for hard datasheets).
     auto = (not use_llm
-            and CONFIG.get("llm_auto_fallback", True)
+            and CONFIG.get("llm_auto_fallback", False)
             and bool(os.getenv("ANTHROPIC_API_KEY"))
             and found < CONFIG.get("llm_fallback_threshold", 25))
 
